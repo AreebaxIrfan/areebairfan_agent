@@ -1,36 +1,21 @@
 import os
 import chainlit as cl
-from agents import Agent, RunConfig, AsyncOpenAI, OpenAIChatCompletionsModel, Runner, function_tool
 from dotenv import load_dotenv, find_dotenv
 from pydantic import BaseModel
 from typing import List, Optional
+import google.generativeai as genai
 import requests
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # Load environment variables
 load_dotenv(find_dotenv())
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not found in environment variables.")
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if not gemini_api_key:
+    raise ValueError("GEMINI_API_KEY not found in environment variables.")
 
-# Set up the OpenAI provider
-provider = AsyncOpenAI(
-    api_key=openai_api_key,
-    base_url="https://api.openai.com/v1/",
-)
-
-# Define the model
-model = OpenAIChatCompletionsModel(
-    model="gpt-4o-mini",  # Use a compatible OpenAI model
-    openai_client=provider,
-)
-
-# Run configuration
-run_config = RunConfig(
-    model=model,
-    model_provider=provider,
-    tracing_disabled=True,
-)
+# Configure Gemini API
+genai.configure(api_key=gemini_api_key)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Pydantic models for API response
 class Contact(BaseModel):
@@ -52,32 +37,28 @@ class Profile(BaseModel):
     projects: List[Project]
     hobbies: List[str]
 
-# Tool to fetch profile data
-@function_tool
+# Function to fetch profile data
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def fetch_profile() -> Profile:
     response = requests.get("https://areebaxirfan.vercel.app/api/profile")
     response.raise_for_status()
     return Profile(**response.json())
 
-# Define the Areeba Irfan Agent
-agent1 = Agent(
-    name="AreebaIrfanAgent",
-    instructions=(
-        "You are the Areeba Irfan Agent, representing Areeba Irfan, an AI engineer. "
-        "Use the fetch_profile tool to retrieve Areeba's data when needed. Answer questions only about: "
-        "- Who Areeba can contact for professional networking or collaborations (use contact info from the profile). "
-        "- How to arrange a meeting with Areeba (suggest emailing her contact.email). "
-        "- Areeba’s free time activities (list hobbies from the profile). "
-        "- Areeba’s career history, skills, or projects (use bio, skills, and projects from the profile). "
-        "Respond in a friendly, professional tone. For irrelevant questions, politely say: "
-        "'I'm sorry, I can only answer questions about Areeba Irfan’s professional connections, skills, projects, or hobbies.' "
-        "Always ask a follow-up question to engage the user, e.g., 'Would you like to know more about Areeba’s projects?'"
-    ),
-    tools=[fetch_profile],
+# Agent instructions
+INSTRUCTIONS = (
+    "You are the Areeba Irfan Agent, representing Areeba Irfan, an AI engineer. "
+    "Use the provided profile data to answer questions only about: "
+    "- Who Areeba can contact for professional networking or collaborations (use contact info from the profile). "
+    "- How to arrange a meeting with Areeba (suggest emailing her contact.email). "
+    "- Areeba’s free time activities (list hobbies from the profile). "
+    "- Areeba’s career history, skills, or projects (use bio, skills, and projects from the profile). "
+    "For irrelevant questions, politely say: "
+    "'I'm sorry, I can only answer questions about Areeba Irfan’s professional connections, skills, projects, or hobbies.' "
+    "Always ask a follow-up question to engage the user, e.g., 'Would you like to know more about Areeba’s projects?' "
+    "Respond in a friendly, professional tone."
 )
 
-# Function to check question relevance (optional, as agent instructions handle this)
+# Function to check if the question is relevant
 def is_relevant_question(question: str) -> bool:
     question = question.lower()
     relevant_keywords = [
@@ -95,24 +76,42 @@ async def handle_chat_start():
 async def handle_message(message: cl.Message):
     history = cl.user_session.get("history")
     
+    # Check if the question is relevant
+    if not is_relevant_question(message.content):
+        response = (
+            "I'm sorry, I can only answer questions about who Areeba Irfan can contact, "
+            "how to meet them, what they do in their free time, their past experience, skills, "
+            "and projects. Please ask a relevant question."
+        )
+        await cl.Message(content=response).send()
+        history.append({"role": "user", "content": message.content})
+        history.append({"role": "assistant", "content": response})
+        cl.user_session.set("history", history[-10:])  # Limit history to last 10 messages
+        return
+
     # Append user message to history
     history.append({"role": "user", "content": message.content})
 
     try:
-        # Run the agent
-        result = await Runner.run(
-            agent1,
-            input=history,
-            run_config=run_config,
-        )
+        # Fetch profile data
+        profile = fetch_profile()
 
-        # Send the response
-        response = str(result.final_output)
-        await cl.Message(content=response).send()
+        # Prepare prompt with instructions, profile data, and history
+        prompt = f"{INSTRUCTIONS}\n\nProfile Data:\n{profile.json()}\n\nConversation History:\n"
+        for msg in history[-5:]:
+            prompt += f"{msg['role'].capitalize()}: {msg['content']}\n"
+        prompt += f"User: {message.content}\nAssistant:"
+
+        # Call Gemini API
+        response = model.generate_content(prompt)
+        response_text = response.text
+
+        # Send response
+        await cl.Message(content=response_text).send()
 
         # Append assistant response to history
-        history.append({"role": "assistant", "content": response})
-        cl.user_session.set("history", history[-10:])  # Limit to last 10 messages
+        history.append({"role": "assistant", "content": response_text})
+        cl.user_session.set("history", history[-10:])
 
     except Exception as e:
         error_message = f"Sorry, an error occurred: {str(e)}. Please try again or ask a question about Areeba’s skills, projects, or hobbies."
