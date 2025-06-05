@@ -11,6 +11,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables. Please set it in your .env file.")
 
 # Set up the provider for Gemini API
+
 provider = AsyncOpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/",
